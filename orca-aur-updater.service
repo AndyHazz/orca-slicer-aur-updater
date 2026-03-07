@@ -1,0 +1,8 @@
+[Unit]
+Description=Check for new OrcaSlicer releases and update AUR package
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/update-orca-aur.sh
