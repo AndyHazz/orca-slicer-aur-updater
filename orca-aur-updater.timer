@@ -1,9 +1,9 @@
 [Unit]
-Description=Check for new OrcaSlicer releases hourly
+Description=Check for new OrcaSlicer releases every 10 minutes
 
 [Timer]
-OnCalendar=hourly
-RandomizedDelaySec=5min
+OnCalendar=*:0/10
+RandomizedDelaySec=1min
 Persistent=true
 
 [Install]
