@@ -187,7 +187,8 @@ with open('$TMPDIR/extracted/bin/orca-slicer', 'rb') as f:
         else
             log "WARNING: Failed to extract binary from squashfs"
         fi
-        rm -f "$TMPDIR/app.squashfs"
+        # Note: $TMPDIR/app.squashfs is left in place for verify_package_assets to reuse;
+        # the EXIT trap clears $TMPDIR.
     else
         log "WARNING: Could not find squashfs offset in AppImage"
     fi
@@ -288,6 +289,117 @@ map_upstream_to_runtime() {
     esac
 }
 
+# Verify PKGBUILD's hardcoded asset paths still exist in the upstream AppImage.
+# Strict failures (missing desktop file, binary, icon dir) exit non-zero before
+# we push to AUR — caught upstream renames before downstream users hit them.
+# Soft warnings (Icon= theme resolution) log only, don't block.
+verify_package_assets() {
+    local appimage="$1"
+    log "Verifying package assets..."
+
+    # Squashfs offset (duplicates check_dependencies logic — small Python snippet,
+    # safer than refactoring shared state)
+    local sqfs_offset
+    sqfs_offset=$(python3 -c "
+import struct
+with open('$appimage', 'rb') as f:
+    data = f.read()
+    pos = 0
+    while True:
+        pos = data.find(b'hsqs', pos)
+        if pos == -1:
+            break
+        ver = struct.unpack_from('<H', data, pos + 28)[0]
+        if ver == 4:
+            print(pos)
+            break
+        pos += 1
+")
+
+    if [[ -z "$sqfs_offset" ]]; then
+        log "FAIL: No squashfs v4 header in AppImage — upstream may have changed AppImage runtime format"
+        return 1
+    fi
+
+    # If check_dependencies didn't leave app.squashfs (e.g. it failed earlier), extract now.
+    if [[ ! -f "$TMPDIR/app.squashfs" ]]; then
+        python3 -c "
+with open('$appimage', 'rb') as fin, open('$TMPDIR/app.squashfs', 'wb') as fout:
+    fin.seek($sqfs_offset)
+    while chunk := fin.read(1048576):
+        fout.write(chunk)
+"
+    fi
+
+    local verify_root="$TMPDIR/verify-root"
+    rm -rf "$verify_root"
+    if ! unsquashfs -f -d "$verify_root" "$TMPDIR/app.squashfs" >/dev/null 2>&1; then
+        log "FAIL: unsquashfs could not extract AppImage filesystem"
+        return 1
+    fi
+
+    local errors=0
+
+    # Strict 1: PKGBUILD prepare() does `sed -i ... squashfs-root/*.desktop`
+    local desktop_files
+    desktop_files=$(find "$verify_root" -maxdepth 1 -name '*.desktop' -type f)
+    if [[ -z "$desktop_files" ]]; then
+        log "FAIL: No *.desktop file in squashfs root — PKGBUILD prepare() sed would no-op"
+        errors=$((errors + 1))
+    else
+        log "OK: desktop file(s): $(echo "$desktop_files" | xargs -n1 basename | tr '\n' ' ')"
+    fi
+
+    # Strict 2: PKGBUILD does `ln -s "/opt/.../bin/orca-slicer" "$pkgdir/usr/bin/orca-slicer"`
+    if [[ ! -f "$verify_root/bin/orca-slicer" ]]; then
+        log "FAIL: bin/orca-slicer missing — /usr/bin/orca-slicer symlink would be dangling"
+        errors=$((errors + 1))
+    else
+        log "OK: bin/orca-slicer present"
+    fi
+
+    # Strict 3: PKGBUILD does `cp -r squashfs-root/usr/share/icons/hicolor/ ...`
+    if [[ ! -d "$verify_root/usr/share/icons/hicolor" ]]; then
+        log "FAIL: usr/share/icons/hicolor/ missing — PKGBUILD icon copy would fail"
+        errors=$((errors + 1))
+    else
+        log "OK: usr/share/icons/hicolor/ present"
+    fi
+
+    # Warning: Icon= value in desktop file resolves to a real file (theme lookup)
+    if [[ -n "$desktop_files" ]]; then
+        local first_desktop
+        first_desktop=$(echo "$desktop_files" | head -1)
+        local icon_name
+        icon_name=$(grep '^Icon=' "$first_desktop" | head -1 | cut -d= -f2-)
+        if [[ -n "$icon_name" ]]; then
+            if [[ "$icon_name" == /* ]]; then
+                if [[ -e "$verify_root${icon_name}" ]]; then
+                    log "OK: Icon=$icon_name resolves"
+                else
+                    log "WARN: Icon=$icon_name (absolute path) not found in squashfs"
+                fi
+            else
+                if find "$verify_root" \( -name "${icon_name}.png" -o -name "${icon_name}.svg" -o -name "${icon_name}.xpm" \) -print -quit | grep -q .; then
+                    log "OK: Icon=$icon_name found"
+                else
+                    log "WARN: Icon=$icon_name has no .png/.svg/.xpm anywhere in squashfs — theme lookup may fail at runtime"
+                fi
+            fi
+        fi
+    fi
+
+    rm -rf "$verify_root"
+
+    if [[ $errors -gt 0 ]]; then
+        log "FAIL: $errors asset verification error(s) — not pushing to AUR"
+        return 1
+    fi
+
+    log "All strict asset checks passed"
+    return 0
+}
+
 # --- Main flow ---
 
 # Clone or update AUR repo
@@ -299,6 +411,10 @@ fi
 
 # Check for dependency changes (uses the downloaded AppImage)
 check_dependencies "$TMPDIR/$APPIMAGE" "$VERSION" "$REPO_DIR"
+
+# Verify PKGBUILD's hardcoded asset paths still match upstream AppImage layout.
+# Strict-fails before any version bump or push.
+verify_package_assets "$TMPDIR/$APPIMAGE"
 
 # Update PKGBUILD version and checksum
 cd "$REPO_DIR"

@@ -8,7 +8,7 @@ Polls the [OrcaSlicer GitHub releases](https://github.com/OrcaSlicer/OrcaSlicer/
 
 1. Checks the GitHub releases API for the latest versioned release (`v*`)
 2. Compares against a local state file (`~/.orca-aur-last-version`)
-3. If new: downloads the AppImage, computes sha512, checks for dependency changes, updates PKGBUILD + .SRCINFO, commits, and pushes to AUR
+3. If new: downloads the AppImage, computes sha512, checks for dependency changes, verifies the AppImage's internal layout still matches the PKGBUILD's hardcoded paths, then updates PKGBUILD + .SRCINFO, commits, and pushes to AUR
 
 ### Version scheme
 
@@ -30,12 +30,24 @@ On each update, the script automatically checks for new dependencies using two m
 
 New dependencies are automatically added to the PKGBUILD `depends` array and `.SRCINFO`.
 
+### Asset verification
+
+Before pushing, the updater extracts the AppImage's squashfs filesystem and checks that the files the PKGBUILD references still exist:
+
+- **Strict (blocks push):** at least one `*.desktop` file in the squashfs root, the `bin/orca-slicer` binary, the `usr/share/icons/hicolor/` directory
+- **Warning only:** the desktop file's `Icon=` value resolves to a real `.png`/`.svg`/`.xpm`
+
+This catches upstream renames at push time instead of at downstream `makepkg` time — e.g. the `OrcaSlicer.desktop` → `com.orcaslicer.OrcaSlicer.desktop` rename in v2.4.0-alpha.
+
+On strict failure the script exits non-zero, which trips `OnFailure=ntfy-failure@%p.service` on the systemd unit and ships the last 50 journal lines via ntfy.
+
 ## Setup
 
 ### Prerequisites
 
 - `curl`, `jq`, `git`, `sha512sum`, `python3`, `unsquashfs` (from `squashfs-tools`)
 - SSH key registered with [AUR](https://aur.archlinux.org/)
+- An ntfy server (optional — only for failure notifications)
 
 ### Install
 
@@ -46,6 +58,12 @@ cd orca-slicer-aur-updater
 # Copy the systemd units
 mkdir -p ~/.config/systemd/user
 cp orca-aur-updater.{service,timer} ~/.config/systemd/user/
+cp ntfy-failure@.service ~/.config/systemd/user/
+
+# Configure ntfy credentials (consumed by the failure notifier)
+cp ntfy-failure.env.example ~/.config/ntfy-failure.env
+chmod 600 ~/.config/ntfy-failure.env
+${EDITOR:-vi} ~/.config/ntfy-failure.env  # set NTFY_URL + NTFY_TOKEN
 
 # Copy the script
 cp update-orca-aur.sh ~/update-orca-aur.sh
@@ -62,6 +80,14 @@ systemctl --user enable --now orca-aur-updater.timer
 ```bash
 ~/update-orca-aur.sh
 ```
+
+### Testing failure notifications
+
+```bash
+systemctl --user start ntfy-failure@orca-aur-updater.service
+```
+
+Triggers the notifier directly (bypassing `OnFailure`) — useful to confirm ntfy credentials work.
 
 ## Configuration
 

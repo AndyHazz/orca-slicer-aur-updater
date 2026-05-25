@@ -2,6 +2,7 @@
 Description=Check for new OrcaSlicer releases and update AUR package
 After=network-online.target
 Wants=network-online.target
+OnFailure=ntfy-failure@%p.service
 
 [Service]
 Type=oneshot

@@ -1,0 +1,18 @@
+[Unit]
+Description=Send ntfy notification when %i fails
+# Templated OnFailure handler. Instantiated by other units via:
+#   OnFailure=ntfy-failure@%n.service
+# %i becomes the failed unit's name; we ship its last 50 journal lines.
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/ntfy-failure.env
+ExecStart=/usr/bin/bash -c '\
+  body=$(journalctl --user -u %i -n 50 --no-pager 2>/dev/null | tail -c 3500); \
+  curl -fsS \
+    -H "Authorization: Bearer $NTFY_TOKEN" \
+    -H "Title: %i failed on plexypi" \
+    -H "Priority: high" \
+    -H "Tags: warning,gear" \
+    -d "$body" \
+    "$NTFY_URL"'
