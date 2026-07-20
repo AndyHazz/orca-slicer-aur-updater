@@ -16,7 +16,7 @@ LOG_TAG="orca-aur-updater"
 log() { logger -t "$LOG_TAG" "$*"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 # Fetch latest release (stable, RC, beta — excluding nightly-builds)
-LATEST=$(curl -sL "$GITHUB_API?per_page=10" \
+LATEST=$(curl -sL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 "$GITHUB_API?per_page=10" \
     | jq -r '[.[] | select(.tag_name | test("^v[0-9]"))][0].tag_name // empty')
 
 if [[ -z "$LATEST" ]]; then
