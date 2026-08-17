@@ -15,8 +15,50 @@ LOG_TAG="orca-aur-updater"
 
 log() { logger -t "$LOG_TAG" "$*"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# --- Failure debounce ---
+# systemd's OnFailure= handler pushes an ntfy alert on every non-zero exit, and
+# a single failed run is nearly always a transient upstream blip (GitHub 5xx,
+# DNS hiccup). A 2.5h GitHub incident on 2026-08-17 produced 15 pushes that way.
+# So: report failure to systemd only once FAIL_THRESHOLD runs in a row have
+# failed. Suppressed failures are still logged, just not pushed. The counter
+# resets on the first success.
+FAIL_STATE_FILE="$HOME/.orca-aur-consecutive-fails"
+FAIL_THRESHOLD=3
+
+# Single EXIT trap: owns both temp cleanup and the failure counter. Do not add
+# another `trap ... EXIT` elsewhere - bash keeps only the most recent one.
+finish() {
+    local status=$?
+
+    if [[ -n "${TMPDIR_CREATED:-}" ]]; then
+        rm -rf "$TMPDIR"
+    fi
+
+    if (( status == 0 )); then
+        rm -f "$FAIL_STATE_FILE"
+        return 0
+    fi
+
+    local prev=0
+    if [[ -f "$FAIL_STATE_FILE" ]]; then
+        prev=$(tr -dc '0-9' < "$FAIL_STATE_FILE")
+        prev=${prev:-0}
+    fi
+    local fails=$(( prev + 1 ))
+    echo "$fails" > "$FAIL_STATE_FILE"
+
+    if (( fails < FAIL_THRESHOLD )); then
+        log "Run failed (exit $status) - consecutive failure $fails/$FAIL_THRESHOLD, staying quiet"
+        exit 0
+    fi
+
+    log "Run failed (exit $status) - consecutive failure $fails/$FAIL_THRESHOLD, alerting"
+    exit "$status"
+}
+trap finish EXIT
+
 # Fetch latest release (stable, RC, beta — excluding nightly-builds)
-LATEST=$(curl -sL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 "$GITHUB_API?per_page=10" \
+LATEST=$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 "$GITHUB_API?per_page=10" \
     | jq -r '[.[] | select(.tag_name | test("^v[0-9]"))][0].tag_name // empty')
 
 if [[ -z "$LATEST" ]]; then
@@ -48,7 +90,7 @@ APPIMAGE="OrcaSlicer_Linux_AppImage_Ubuntu2404_V${VERSION}.AppImage"
 DOWNLOAD_URL="https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v${VERSION}/${APPIMAGE}"
 
 TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+TMPDIR_CREATED=1   # tells the EXIT trap it owns this dir (never an inherited TMPDIR)
 
 log "Downloading $APPIMAGE..."
 if ! curl -fSL -o "$TMPDIR/$APPIMAGE" "$DOWNLOAD_URL"; then
