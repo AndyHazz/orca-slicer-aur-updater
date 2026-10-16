@@ -15,6 +15,25 @@ LOG_TAG="orca-aur-updater"
 
 log() { logger -t "$LOG_TAG" "$*"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# Non-fatal ntfy push for things that need a human look but shouldn't block the
+# release (failures go through systemd OnFailure= instead). Reuses the
+# ntfy-failure@ credentials.
+NTFY_ENV="$HOME/.config/ntfy-failure.env"
+notify() {
+    local title="$1" body="$2"
+    if [[ ! -f "$NTFY_ENV" ]]; then
+        log "WARN: $NTFY_ENV missing, can't send ntfy: $title"
+        return 0
+    fi
+    ( set -a; . "$NTFY_ENV"; set +a
+      curl -fsS -m 15 \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: $title" \
+        -H "Tags: package" \
+        -d "$body" \
+        "$NTFY_URL" >/dev/null ) || log "WARN: ntfy push failed: $title"
+}
+
 # --- Failure debounce ---
 # systemd's OnFailure= handler pushes an ntfy alert on every non-zero exit, and
 # a single failed run is nearly always a transient upstream blip (GitHub 5xx,
@@ -111,6 +130,7 @@ check_dependencies() {
     local version="$2"
     local repo_dir="$3"
     local new_deps=()
+    local review=()
 
     # Get current PKGBUILD depends
     local current_deps
@@ -211,11 +231,26 @@ with open('$TMPDIR/extracted/bin/orca-slicer', 'rb') as f:
                     new_libs=$(comm -23 <(echo "$elf_libs" | sort) <(echo "$prev_elf_deps" | sort))
                     if [[ -n "$new_libs" ]]; then
                         log "New ELF dependencies detected: $new_libs"
+                        # Libraries shipped inside the AppImage (lib/orca-runtime, lib/python
+                        # etc.) are found via orca-slicer-env/RUNPATH, so they aren't deps
+                        local bundled_libs
+                        bundled_libs=$(unsquashfs -l "$TMPDIR/app.squashfs" 2>/dev/null \
+                            | grep -oP '[^/]+\.so[^/]*$' | sort -u)
                         # Map .so names to Arch package names using Ubuntu→Arch common mappings
                         # (Can't use pacman on ARM Pi, so use a known mapping table)
                         while read -r lib; do
+                            if grep -qxF "$lib" <<< "$bundled_libs"; then
+                                log "Bundled in AppImage, not a dep: $lib"
+                                continue
+                            fi
                             local pkg
-                            pkg=$(map_lib_to_package "$lib")
+                            if ! pkg=$(map_lib_to_package "$lib"); then
+                                # Never add a raw soname: pacman can't resolve it and
+                                # the package becomes uninstallable
+                                review+=("unmapped lib: $lib")
+                                log "WARN: no package mapping for $lib, not adding (needs review)"
+                                continue
+                            fi
                             if [[ -n "$pkg" ]] && ! echo "$current_deps" | grep -qw "$pkg"; then
                                 new_deps+=("$pkg")
                                 log "New dependency needed: $pkg (provides $lib)"
@@ -250,9 +285,14 @@ with open('$TMPDIR/extracted/bin/orca-slicer', 'rb') as f:
                 log "New upstream Arch dependencies: $new_upstream"
                 while read -r pkg; do
                     [[ -z "$pkg" ]] && continue
-                    # Map upstream package names to runtime equivalents
+                    # Map upstream package names to runtime equivalents. These are
+                    # build deps for a source build, so unknown ones are flagged, not added
                     local mapped
-                    mapped=$(map_upstream_to_runtime "$pkg")
+                    if ! mapped=$(map_upstream_to_runtime "$pkg"); then
+                        review+=("unmapped upstream dep: $pkg")
+                        log "WARN: no runtime mapping for upstream dep $pkg, not adding (needs review)"
+                        continue
+                    fi
                     if [[ -n "$mapped" ]] && ! echo "$current_deps" | grep -qw "$mapped"; then
                         new_deps+=("$mapped")
                         log "New upstream dependency: $mapped (from $pkg)"
@@ -281,6 +321,12 @@ with open('$TMPDIR/extracted/bin/orca-slicer', 'rb') as f:
     else
         log "No new dependencies detected"
     fi
+
+    if [[ ${#review[@]} -gt 0 ]]; then
+        notify "orca-slicer-unstable-bin $version: deps need review" \
+            "$(printf '%s\n' "${review[@]}")
+Not added to depends. Check whether the AppImage still runs on Arch and update the PKGBUILD or the mapping tables in update-orca-aur.sh."
+    fi
 }
 
 # Map common .so names to Arch package names
@@ -300,10 +346,11 @@ map_lib_to_package() {
         libEGL.so*|libGL.so*|libGLX.so*|libOpenGL.so*) echo "" ;; # libglvnd, transitive
         libsecret*.so*)    echo "" ;; # transitive via webkit2gtk
         libsoup*.so*)      echo "" ;; # transitive via webkit2gtk
+        libjavascriptcoregtk*.so*) echo "" ;; # transitive via webkit2gtk-4.1
         lib[Xx]*.so*)      echo "" ;; # X11 libs, transitive
         libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*) echo "" ;; # glibc
         libgcc_s.so*|libstdc++.so*) echo "" ;; # gcc runtime
-        libglib-2.0.so*|libgobject-2.0.so*|libgio-2.0.so*) echo "" ;; # transitive
+        libglib-2.0.so*|libgobject-2.0.so*|libgio-2.0.so*|libgmodule-2.0.so*) echo "" ;; # glib2, transitive
         libpango*.so*)     echo "" ;; # transitive via gtk3
         libharfbuzz*.so*)  echo "" ;; # transitive via pango
         libfontconfig*.so*) echo "" ;; # transitive
@@ -311,7 +358,7 @@ map_lib_to_package() {
         libgdk_pixbuf*.so*) echo "" ;; # transitive via gtk3
         libdbus*.so*)      echo "" ;; # transitive
         libz.so*)          echo "" ;; # zlib, transitive
-        *)                 echo "$lib" ;; # unknown — return as-is for logging
+        *)                 return 1 ;; # unknown: caller flags it for review
     esac
 }
 
@@ -321,13 +368,19 @@ map_upstream_to_runtime() {
     # Skip build-only tools
     case "$pkg" in
         cmake|ninja|git|wget|curl|file|gettext|texinfo|extra-cmake-modules|lld|clang) echo "" ;;
+        nasm|yasm|pkgconf|pkg-config|autoconf|automake|libtool|m4|meson|python-pip) echo "" ;;
         # Map upstream names to runtime equivalents
         webkit2gtk)        echo "webkit2gtk-4.1" ;;
         gstreamermm)       echo "" ;; # C++ bindings, build-only
         eglexternalplatform) echo "" ;; # dev headers only
         mesa|openssl|dbus) echo "" ;; # transitive deps
         glew|libspnav)     echo "" ;; # not linked at runtime (statically linked or optional)
-        *)                 echo "$pkg" ;;
+        wayland-protocols) echo "" ;; # protocol XML, build-only
+        libsecret)         echo "" ;; # transitive via webkit2gtk
+        # Known runtime packages, same name on Arch
+        gtk3|gstreamer|gst-plugins-base|gst-plugins-good|gst-libav|libmspack|glu|cairo|wayland|ttf-nanum)
+                           echo "$pkg" ;;
+        *)                 return 1 ;; # unknown: caller flags it for review
     esac
 }
 
@@ -392,12 +445,20 @@ with open('$appimage', 'rb') as fin, open('$TMPDIR/app.squashfs', 'wb') as fout:
         log "OK: desktop file(s): $(echo "$desktop_files" | xargs -n1 basename | tr '\n' ' ')"
     fi
 
-    # Strict 2: PKGBUILD does `ln -s "/opt/.../bin/orca-slicer" "$pkgdir/usr/bin/orca-slicer"`
+    # Strict 2: PKGBUILD's /usr/bin/orca-slicer wrapper execs
+    # libexec/orca-slicer-env bin/orca-slicer (the env script puts the bundled
+    # lib/orca-runtime libs on LD_LIBRARY_PATH; the bare binary can't start)
     if [[ ! -f "$verify_root/bin/orca-slicer" ]]; then
-        log "FAIL: bin/orca-slicer missing — /usr/bin/orca-slicer symlink would be dangling"
+        log "FAIL: bin/orca-slicer missing — /usr/bin/orca-slicer wrapper would fail"
         errors=$((errors + 1))
     else
         log "OK: bin/orca-slicer present"
+    fi
+    if [[ ! -f "$verify_root/libexec/orca-slicer-env" ]]; then
+        log "FAIL: libexec/orca-slicer-env missing — /usr/bin/orca-slicer wrapper would fail"
+        errors=$((errors + 1))
+    else
+        log "OK: libexec/orca-slicer-env present"
     fi
 
     # Strict 3: PKGBUILD does `cp -r squashfs-root/usr/share/icons/hicolor/ ...`
